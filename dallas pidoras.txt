@@ -1,0 +1,1027 @@
+--[[
+    ==============================================================================
+    Ultimate Gun Automation Pro (Spas 12 & Remington) - РУСИФИЦИРОВАННАЯ ВЕРСИЯ
+    ==============================================================================
+--]]
+
+local FireEvent = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game:GetService("ReplicatedStorage").Remotes:FindFirstChild("Fire")
+local ReloadEvent = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game:GetService("ReplicatedStorage").Remotes:FindFirstChild("Reload")
+local SwingEvent = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game:GetService("ReplicatedStorage").Remotes:FindFirstChild("Swing")
+local Players = game:GetService("Players")
+local localPlayer = Players.LocalPlayer
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Camera = Workspace.CurrentCamera
+
+-- Константы и состояния
+local PELLET_COUNT = 7 
+local MAX_BEFORE_RELOAD = 1
+
+local autoEnabled = false
+local targetAllEnabled = false
+local simultaneousShootEnabled = false
+local autoBlockEnabled = false
+local currentSpread = 0.1 
+local FIRE_RATE = 0.15   
+local reloadSpeed = 0.05 
+local platformSpeed = 10000 
+local reEquipEnabled = false
+local autoThread = nil
+local blockThread = nil
+
+local autoEquipEnabled = false 
+local movingPlatformEnabled = false 
+local autoHealEnabled = false 
+
+-- Выбор оружия и настройки двойного огня
+local selectedWeaponMode = "Spas 12" -- "Spas 12", "Remington", "Both"
+local dualFocusMode = "Split" -- "Split"(разные цели), "Concentrate"(одна цель)
+local dualFireSyncMode = "Simultaneous" -- "Simultaneous"(одновременно), "Sequential"(по очереди)
+local nextGunIndex = 1 -- для поочередной стрельбы
+
+-- Координаты лечения
+local HEAL_POSITION = Vector3.new(731.8, 2385.1, 248.1)
+local originalPosition = nil
+local isHealing = false
+
+local userStates = {} 
+local shotsFired = 0
+local isReloading = false
+local executionTarget = nil 
+local spectatingTarget = nil 
+
+local movingPlatform = nil
+
+-- Получение активного оружия
+local function getActiveTools()
+    local tools = {}
+    local backpack = localPlayer:FindFirstChild("Backpack")
+    local char = localPlayer.Character
+    
+    local function checkAndAdd(name)
+        local t = (backpack and backpack:FindFirstChild(name)) or (char and char:FindFirstChild(name))
+        if t then table.insert(tools, t) end
+    end
+
+    if selectedWeaponMode == "Spas 12" then
+        checkAndAdd("Spas 12")
+    elseif selectedWeaponMode == "Remington" then
+        checkAndAdd("Remington")
+    elseif selectedWeaponMode == "Both" then
+        checkAndAdd("Spas 12")
+        checkAndAdd("Remington")
+    end
+    return tools
+end
+
+-- Получение любого доступного оружия
+local function getTool()
+    local tools = getActiveTools()
+    return tools[1]
+end
+
+-- Временное отключение столкновений
+local function setCharacterCollision(char, canCollide)
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = canCollide
+        end
+    end
+end
+
+-- Автоматический подбор оружия
+local function tryAutoEquipWeapon()
+    local currentTools = getActiveTools()
+   
+    local needsSpas = false
+    local needsRem = false
+    
+    if selectedWeaponMode == "Spas 12" then
+        if #currentTools >= 1 then return end
+        needsSpas = true
+    elseif selectedWeaponMode == "Remington" then
+        if #currentTools >= 1 then return end
+        needsRem = true
+    elseif selectedWeaponMode == "Both" then
+        if #currentTools >= 2 then return end
+        local hasSpas, hasRem = false, false
+        for _, t in ipairs(currentTools) do
+            if t.Name == "Spas 12" then hasSpas = true end
+            if t.Name == "Remington" then hasRem = true end
+        end
+        needsSpas = not hasSpas
+        needsRem = not hasRem
+    end
+    
+    local char = localPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    local rootPart = char.HumanoidRootPart
+    local originalCFrame = rootPart.CFrame
+    
+    local targetNames = {}
+    if needsSpas then table.insert(targetNames, "spas 12") end
+    if needsRem then table.insert(targetNames, "remington") end
+
+    local foundTarget = nil
+    for _, obj in pairs(Workspace:GetDescendants()) do
+        local nameLower = string.lower(obj.Name)
+        for _, tName in ipairs(targetNames) do
+            if nameLower == tName then
+                foundTarget = obj
+                break
+            end
+        end
+        if foundTarget then break end
+    end
+
+    if foundTarget then
+        local targetCFrame = nil
+        if foundTarget:IsA("Model") and foundTarget.PrimaryPart then
+            targetCFrame = foundTarget.PrimaryPart.CFrame
+        elseif foundTarget:IsA("BasePart") then
+            targetCFrame = foundTarget.CFrame
+        elseif foundTarget:IsA("Tool") and foundTarget:FindFirstChild("Handle") then
+            targetCFrame = foundTarget.Handle.CFrame
+        else
+            local part = foundTarget:FindFirstChildWhichIsA("BasePart", true)
+            if part then targetCFrame = part.CFrame end
+        end
+
+        if targetCFrame then
+            setCharacterCollision(char, false)
+            rootPart.CFrame = targetCFrame + Vector3.new(0, 1, 0)
+            task.wait(0.2)
+        
+            local prompt = foundTarget:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and fireproximityprompt then fireproximityprompt(prompt) end
+            local clickDetector = foundTarget:FindFirstChildWhichIsA("ClickDetector", true)
+            if clickDetector and fireclickdetector then fireclickdetector(clickDetector) end
+            task.wait(0.2)
+            rootPart.CFrame = originalCFrame
+            setCharacterCollision(char, true)
+        end
+    end
+end
+
+-- Управление движущейся платформой
+local function updateMovingPlatform()
+    if movingPlatformEnabled then
+        local char = localPlayer.Character
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then
+            if movingPlatform then movingPlatform:Destroy(); movingPlatform = nil end
+            originalPosition = nil
+            return
+        end
+
+        if not movingPlatform or not movingPlatform.Parent then
+            movingPlatform = Instance.new("Part")
+            movingPlatform.Name = "АвтоПлатформа"
+            movingPlatform.Size = Vector3.new(30, 2, 30)
+            movingPlatform.Position = Vector3.new(10000, 5000, 10000)
+            movingPlatform.Anchored = true
+            movingPlatform.Material = Enum.Material.Neon
+            movingPlatform.Color = Color3.fromRGB(0, 150, 255)
+            movingPlatform.Parent = Workspace
+        end
+        local timeTick = os.clock() * (platformSpeed / 200) 
+       
+        movingPlatform.CFrame = CFrame.new(10000 + math.sin(timeTick * 0.05) * 500, 5000, 10000 + math.cos(timeTick * 0.05) * 500)
+        
+        if char and char:FindFirstChild("HumanoidRootPart") and not isHealing then
+            local root = char.HumanoidRootPart
+            if (root.Position - movingPlatform.Position).Magnitude > 40 then
+                if not originalPosition then originalPosition = root.CFrame end
+                setCharacterCollision(char, false)
+                root.CFrame = movingPlatform.CFrame + Vector3.new(0, 4, 0)
+            end
+        end
+    else
+        if movingPlatform then
+            movingPlatform:Destroy()
+            movingPlatform = nil
+            if originalPosition and not isHealing then
+                local char = localPlayer.Character
+                if char and char:FindFirstChild("HumanoidRootPart") then
+                    char.HumanoidRootPart.CFrame = originalPosition
+                end
+                originalPosition = nil
+            end
+        end
+    end
+end
+
+-- Перезарядка
+local function reloadTool(tool)
+    if not tool or isReloading then return end
+    task.spawn(function()
+        if ReloadEvent then
+            pcall(function()
+                ReloadEvent:InvokeServer(tool, "Start Reload")
+                task.wait(reloadSpeed)
+                ReloadEvent:InvokeServer(tool, "New Shell")
+                task.wait(reloadSpeed)
+                ReloadEvent:InvokeServer(tool, "Insert Shell")
+                task.wait(reloadSpeed)
+                ReloadEvent:InvokeServer(tool, "Stop Reload")
+            end)
+        end
+    end)
+end
+
+-- Визуальные трассеры пуль
+local function drawTracer(origin, target, weaponName)
+    local distance = (target - origin).Magnitude
+    local tracer = Instance.new("Part")
+    tracer.Name = "Трассер"
+    tracer.Anchored = true
+    tracer.CanCollide = false
+    tracer.CanQuery = false
+    tracer.CastShadow = false
+    tracer.Material = Enum.Material.Neon
+    
+    if weaponName == "Remington" then
+        tracer.Color = Color3.fromRGB(50, 150, 255) -- Синий для Remington
+    else
+        tracer.Color = Color3.fromRGB(255, 180, 50) -- Оранжевый для Spas 12
+    end
+    
+    tracer.Size = Vector3.new(0.08, 0.08, distance)
+    tracer.CFrame = CFrame.lookAt(origin, target) * CFrame.new(0, 0, -distance / 2)
+    tracer.Parent = Workspace
+    
+    local tween = TweenService:Create(tracer, TweenInfo.new(0.15), {
+        Transparency = 1,
+        Size = Vector3.new(0, 0, distance)
+    })
+    tween:Play()
+    Debris:AddItem(tracer, 0.2)
+end
+
+local function isTargetAlive(player)
+    if not player then return false end
+    local char = player.Character
+    if not char then return false end
+    local head = char:FindFirstChild("Head")
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not head or not humanoid then return false end
+    if humanoid.Health <= 0 then return false end
+    return true
+end
+
+-- Получение следующей цели
+local function getNextExecutionTarget()
+    if executionTarget and isTargetAlive(executionTarget) then
+        local uid = executionTarget.UserId
+        local isWhite = userStates[uid] and userStates[uid].state == "Белый"
+        local isLock = userStates[uid] and userStates[uid].state == "Заблокирован"
+        if not isWhite and (targetAllEnabled or isLock) then
+            return executionTarget
+        end
+    end
+
+    local candidates = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == localPlayer then continue end
+        local uid = p.UserId
+        local isWhite = userStates[uid] and userStates[uid].state == "Белый"
+        local isLock = userStates[uid] and userStates[uid].state == "Заблокирован"
+        
+        if isWhite or not isTargetAlive(p) then continue end
+        if targetAllEnabled or isLock then
+            table.insert(candidates, p)
+        end
+    end
+
+    if #candidates == 0 then executionTarget = nil return nil end
+    table.sort(candidates, function(a, b) return a.UserId < b.UserId end)
+
+    local nextIdx = 1
+    if executionTarget then
+        for i, p in ipairs(candidates) do
+            if p.UserId > executionTarget.UserId then nextIdx = i break end
+        end
+    end
+
+    executionTarget = candidates[nextIdx]
+    return executionTarget
+end
+
+-- Основная функция выстрела
+local function fireGunAtTarget(tool, targetPlayer)
+    local myChar = localPlayer.Character
+    if not myChar or not myChar:FindFirstChild("HumanoidRootPart") then return end
+    local muzzle = tool:FindFirstChild("Muzzle") or tool:FindFirstChild("Barrel") or tool:FindFirstChild("Handle")
+    local origin = muzzle and muzzle.Position or myChar.HumanoidRootPart.Position
+
+    local targetChar = targetPlayer.Character
+    local head = targetChar and targetChar:FindFirstChild("Head")
+    if not head then return end
+
+    local headCenter = head.Position
+    local mainDirection = (headCenter - origin).Unit
+    local weaponName = tool.Name 
+
+    if FireEvent then
+        FireEvent:FireServer(tool, "Fire", {
+            ["velocity"] = 2000,
+            ["direction"] = mainDirection,
+            ["bullet"] = game:GetService("ReplicatedStorage").Models.Bullets.Default,
+            ["origin"] = origin
+        })
+
+        task.spawn(function()
+            for i = 1, PELLET_COUNT do
+                local offset = Vector3.new(
+                    (math.random() - 0.5) * currentSpread,
+                    (math.random() - 0.5) * currentSpread,
+                    (math.random() - 0.5) * currentSpread
+                )
+                local aimPoint = headCenter + offset
+                local direction = (aimPoint - origin).Unit
+                
+                drawTracer(origin, aimPoint, weaponName)
+
+                if weaponName == "Remington" then
+                    FireEvent:FireServer("Remington", "Hit", {
+                        ["normal"] = -direction, 
+                        ["bullet_cframe"] = CFrame.lookAt(aimPoint, aimPoint + direction), 
+                        ["hit"] = head,
+                        ["velocity"] = direction * 2000,
+                        ["position"] = origin 
+                    })
+                else
+                    FireEvent:FireServer(tool, "Hit", {
+                        ["normal"] = -direction, 
+                        ["bullet_cframe"] = CFrame.lookAt(aimPoint, aimPoint + direction), 
+                        ["hit"] = head,
+                        ["velocity"] = direction * 2000,
+                        ["position"] = origin 
+                    })
+                end
+            end
+        end)
+    end
+end
+
+-- Основная логика стрельбы
+local function shoot()
+    if isHealing then return end 
+    local tools = getActiveTools()
+    if #tools == 0 then return end
+
+    local allValidTargets = {}
+  
+    if simultaneousShootEnabled then
+        if targetAllEnabled then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p == localPlayer then continue end
+                local uid = p.UserId
+                local isWhite = userStates[uid] and userStates[uid].state == "Белый"
+                if not isWhite and isTargetAlive(p) then
+                    table.insert(allValidTargets, p)
+                end
+            end
+        else
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p == localPlayer then continue end
+                local uid = p.UserId
+                local isLock = userStates[uid] and userStates[uid].state == "Заблокирован"
+                if isLock and isTargetAlive(p) then
+                    table.insert(allValidTargets, p)
+                end
+            end
+            
+            if #allValidTargets == 0 then
+                local t = getNextExecutionTarget()
+                if t then table.insert(allValidTargets, t) end
+            end
+        end
+    else
+        local t = getNextExecutionTarget()
+        if t then table.insert(allValidTargets, t) end
+    end
+
+    if #allValidTargets == 0 then return end
+
+    if dualFireSyncMode == "Sequential" and #tools >= 2 then
+        if nextGunIndex > #tools then nextGunIndex = 1 end
+        local tool = tools[nextGunIndex]
+        for _, target in ipairs(allValidTargets) do
+            fireGunAtTarget(tool, target)
+        end
+        nextGunIndex = (nextGunIndex % #tools) + 1
+    else
+        if #tools == 2 and dualFocusMode == "Split" and #allValidTargets >= 2 then
+            fireGunAtTarget(tools[1], allValidTargets[1])
+            fireGunAtTarget(tools[2], allValidTargets[2])
+        else
+            for _, tool in ipairs(tools) do
+                for _, target in ipairs(allValidTargets) do
+                    fireGunAtTarget(tool, target)
+                end
+            end
+        end
+    end
+
+    shotsFired = shotsFired + 1
+end
+
+-- Автоблок
+local function blockLoop()
+    while autoBlockEnabled do
+        if SwingEvent then
+            pcall(function() SwingEvent:FireServer("Block") end)
+        end
+        task.wait(0.1)
+    end
+end
+
+-- Основной цикл мониторинга
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        local char = localPlayer.Character
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+
+        if not humanoid or humanoid.Health <= 0 then
+            isHealing = false
+            originalPosition = nil
+            continue
+        end
+
+        if autoEquipEnabled then
+            tryAutoEquipWeapon()
+        end
+
+        if autoHealEnabled and humanoid and rootPart then
+            if humanoid.Health < humanoid.MaxHealth then
+                if not isHealing then
+                    isHealing = true
+                    originalPosition = rootPart.CFrame
+                end
+                setCharacterCollision(char, false)
+                rootPart.CFrame = CFrame.new(HEAL_POSITION)
+            else
+                if isHealing then
+                    isHealing = false
+                    setCharacterCollision(char, true)
+                    if originalPosition and not movingPlatformEnabled then
+                        rootPart.CFrame = originalPosition
+                    end
+                    originalPosition = nil
+                end
+            end
+        else
+            if isHealing then
+                isHealing = false
+                if char then setCharacterCollision(char, true) end
+            end
+        end
+
+        updateMovingPlatform()
+
+        if spectatingTarget and spectatingTarget.Character then
+            local targetChar = spectatingTarget.Character
+            local targetHumanoid = targetChar:FindFirstChildOfClass("Humanoid")
+            if targetHumanoid then
+                Camera.CameraSubject = targetHumanoid
+            end
+        end
+    end
+end)
+
+local function autoLoop()
+    while autoEnabled do
+        if not isHealing then
+            if shotsFired >= MAX_BEFORE_RELOAD then
+                for _, tool in ipairs(getActiveTools()) do
+                    reloadTool(tool)
+                end
+                shotsFired = 0
+            end
+            shoot()
+        end
+        task.wait(FIRE_RATE)
+    end
+end
+
+-- ========== РУССКИЙ ИНТЕРФЕЙС ==========
+local uiParent = nil
+if gethui then
+    uiParent = gethui()
+else
+    local success, coreGui = pcall(function() return game:GetService("CoreGui") end)
+    if success and coreGui then
+        uiParent = coreGui
+    else
+        uiParent = localPlayer:WaitForChild("PlayerGui")
+    end
+end
+
+if uiParent:FindFirstChild("UltimateGunAutomationGUI") then 
+    uiParent:FindFirstChild("UltimateGunAutomationGUI"):Destroy() 
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "UltimateGunAutomationGUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = uiParent
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 210, 0, 280) 
+mainFrame.Position = UDim2.new(0, 20, 0, 20)
+mainFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+mainFrame.BackgroundTransparency = 0.1
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.ClipsDescendants = true
+mainFrame.Parent = screenGui
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 22)
+titleBar.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -45, 1, 0)
+title.Position = UDim2.new(0, 4, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "⚔️ Авто-Дробовик PRO ⚔️"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.SourceSansBold
+title.TextSize = 11
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 20, 0, 20)
+minimizeBtn.Position = UDim2.new(1, -42, 0, 1)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+minimizeBtn.Text = "─"
+minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+minimizeBtn.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 20, 0, 20)
+closeBtn.Position = UDim2.new(1, -21, 0, 1)
+closeBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Parent = titleBar
+
+local contentScroll = Instance.new("ScrollingFrame")
+contentScroll.Size = UDim2.new(1, 0, 1, -22)
+contentScroll.Position = UDim2.new(0, 0, 0, 22)
+contentScroll.BackgroundTransparency = 1
+contentScroll.BorderSizePixel = 0
+contentScroll.ScrollBarThickness = 3
+contentScroll.Parent = mainFrame
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 2)
+listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = contentScroll
+
+listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    contentScroll.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 8)
+end)
+
+local function createSettingsItem(name, height, order)
+    local f = Instance.new("Frame")
+    f.Name = name
+    f.Size = UDim2.new(1, -6, 0, height)
+    f.BackgroundTransparency = 1
+    f.LayoutOrder = order
+    f.Parent = contentScroll
+    return f
+end
+
+-- 1. Авто-огонь
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(1, 0, 1, 0)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+toggleBtn.Text = "🔫 Авто-огонь: ВЫКЛ"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.SourceSansBold
+toggleBtn.TextSize = 11
+toggleBtn.Parent = createSettingsItem("TglAuto", 22, 1)
+
+-- 2. Автоблок
+local blockBtn = Instance.new("TextButton")
+blockBtn.Size = UDim2.new(1, 0, 1, 0)
+blockBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+blockBtn.Text = "🛡️ Автоблок: ВЫКЛ"
+blockBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+blockBtn.Font = Enum.Font.SourceSansBold
+blockBtn.TextSize = 11
+blockBtn.Parent = createSettingsItem("TglBlock", 22, 2)
+
+-- 3. Выбор оружия
+local weaponSelectBtn = Instance.new("TextButton")
+weaponSelectBtn.Size = UDim2.new(1, 0, 1, 0)
+weaponSelectBtn.BackgroundColor3 = Color3.fromRGB(40, 90, 150)
+weaponSelectBtn.Text = "🎯 Оружие: Spas 12"
+weaponSelectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+weaponSelectBtn.Font = Enum.Font.SourceSansBold
+weaponSelectBtn.TextSize = 11
+weaponSelectBtn.Parent = createSettingsItem("TglWeapon", 22, 3)
+
+-- 4. Автоподбор
+local autoEquipBtn = Instance.new("TextButton")
+autoEquipBtn.Size = UDim2.new(1, 0, 1, 0)
+autoEquipBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+autoEquipBtn.Text = "📥 Автоподбор: ВЫКЛ"
+autoEquipBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+autoEquipBtn.Font = Enum.Font.SourceSansBold
+autoEquipBtn.TextSize = 11
+autoEquipBtn.Parent = createSettingsItem("TglAutoEquip", 22, 4)
+
+-- 5. Режим двойного оружия
+local dualModeBtn = Instance.new("TextButton")
+dualModeBtn.Size = UDim2.new(1, 0, 1, 0)
+dualModeBtn.BackgroundColor3 = Color3.fromRGB(80, 50, 140)
+dualModeBtn.Text = "🎯 Двойное: разные цели"
+dualModeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+dualModeBtn.Font = Enum.Font.SourceSansBold
+dualModeBtn.TextSize = 11
+dualModeBtn.Parent = createSettingsItem("TglDualMode", 22, 5)
+
+-- 6. Синхронизация стрельбы
+local dualSyncBtn = Instance.new("TextButton")
+dualSyncBtn.Size = UDim2.new(1, 0, 1, 0)
+dualSyncBtn.BackgroundColor3 = Color3.fromRGB(120, 60, 100)
+dualSyncBtn.Text = "⏱️ Стрельба: одновременная"
+dualSyncBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+dualSyncBtn.Font = Enum.Font.SourceSansBold
+dualSyncBtn.TextSize = 11
+dualSyncBtn.Parent = createSettingsItem("TglDualSync", 22, 6)
+
+-- 7. Платформа
+local platformBtn = Instance.new("TextButton")
+platformBtn.Size = UDim2.new(1, 0, 1, 0)
+platformBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+platformBtn.Text = "🚀 Платформа: ВЫКЛ"
+platformBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+platformBtn.Font = Enum.Font.SourceSansBold
+platformBtn.TextSize = 11
+platformBtn.Parent = createSettingsItem("TglPlatform", 22, 7)
+
+-- 8. Автолечение
+local healBtn = Instance.new("TextButton")
+healBtn.Size = UDim2.new(1, 0, 1, 0)
+healBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+healBtn.Text = "💚 Автолечение: ВЫКЛ"
+healBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+healBtn.Font = Enum.Font.SourceSansBold
+healBtn.TextSize = 11
+healBtn.Parent = createSettingsItem("TglHeal", 22, 8)
+
+-- 9. Целиться во всех
+local targetAllBtn = Instance.new("TextButton")
+targetAllBtn.Size = UDim2.new(1, 0, 1, 0)
+targetAllBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+targetAllBtn.Text = "👥 Целиться во всех: ВЫКЛ"
+targetAllBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+targetAllBtn.Font = Enum.Font.SourceSansBold
+targetAllBtn.TextSize = 11
+targetAllBtn.Parent = createSettingsItem("TglTargetAll", 22, 9)
+
+-- 10. Режим убийства всех
+local shootModeBtn = Instance.new("TextButton")
+shootModeBtn.Size = UDim2.new(1, 0, 1, 0)
+shootModeBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+shootModeBtn.Text = "💀 Убить всех: по очереди"
+shootModeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+shootModeBtn.Font = Enum.Font.SourceSansBold
+shootModeBtn.TextSize = 11
+shootModeBtn.Parent = createSettingsItem("TglShootMode", 22, 10)
+
+-- 11. Скорость стрельбы
+local fireRateFrame = createSettingsItem("FireRateConf", 20, 11)
+local fireRateLabel = Instance.new("TextLabel")
+fireRateLabel.Size = UDim2.new(0.6, 0, 1, 0)
+fireRateLabel.BackgroundTransparency = 1
+fireRateLabel.Text = "⏱️ Интервал (сек):"
+fireRateLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+fireRateLabel.Font = Enum.Font.SourceSans
+fireRateLabel.TextSize = 11
+fireRateLabel.TextXAlignment = Enum.TextXAlignment.Left
+fireRateLabel.Parent = fireRateFrame
+
+local fireRateInput = Instance.new("TextBox")
+fireRateInput.Size = UDim2.new(0.4, 0, 1, 0)
+fireRateInput.Position = UDim2.new(0.6, 0, 0, 0)
+fireRateInput.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+fireRateInput.Text = tostring(FIRE_RATE)
+fireRateInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+fireRateInput.Font = Enum.Font.SourceSans
+fireRateInput.TextSize = 11
+fireRateInput.Parent = fireRateFrame
+
+fireRateInput.FocusLost:Connect(function()
+    local num = tonumber(fireRateInput.Text)
+    if num and num > 0 then FIRE_RATE = num else fireRateInput.Text = tostring(FIRE_RATE) end
+end)
+
+-- 12. Статус
+local executionLabel = Instance.new("TextLabel")
+executionLabel.Size = UDim2.new(1, 0, 1, 0)
+executionLabel.BackgroundTransparency = 1
+executionLabel.Text = "📊 Статус: Ожидание..."
+executionLabel.TextColor3 = Color3.fromRGB(255, 255, 50)
+executionLabel.Font = Enum.Font.SourceSansBold
+executionLabel.TextSize = 11
+executionLabel.Parent = createSettingsItem("ExecutionStatus", 18, 12)
+
+-- 13. Наблюдение
+local spectateFrame = createSettingsItem("SpectateInfo", 20, 13)
+local spectateText = Instance.new("TextLabel")
+spectateText.Size = UDim2.new(0.7, 0, 1, 0)
+spectateText.BackgroundTransparency = 1
+spectateText.Text = "👁️ Наблюдение: нет"
+spectateText.TextColor3 = Color3.fromRGB(100, 200, 255)
+spectateText.Font = Enum.Font.SourceSansBold
+spectateText.TextSize = 10
+spectateText.TextXAlignment = Enum.TextXAlignment.Left
+spectateText.Parent = spectateFrame
+
+local stopSpectateBtn = Instance.new("TextButton")
+stopSpectateBtn.Size = UDim2.new(0.3, 0, 1, 0)
+stopSpectateBtn.Position = UDim2.new(0.7, 0, 0, 0)
+stopSpectateBtn.BackgroundColor3 = Color3.fromRGB(150, 50, 50)
+stopSpectateBtn.Text = "Отмена"
+stopSpectateBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+stopSpectateBtn.Font = Enum.Font.SourceSans
+stopSpectateBtn.TextSize = 10
+stopSpectateBtn.Parent = spectateFrame
+
+stopSpectateBtn.MouseButton1Click:Connect(function()
+    spectatingTarget = nil
+    if localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        Camera.CameraSubject = localPlayer.Character.Humanoid
+    end
+    spectateText.Text = "👁️ Наблюдение: нет"
+end)
+
+local onlineTitle = Instance.new("TextLabel")
+onlineTitle.Size = UDim2.new(1, 0, 1, 0)
+onlineTitle.BackgroundTransparency = 1
+onlineTitle.Text = "━━━ 👥 ИГРОКИ (клик для статуса) ━━━"
+onlineTitle.TextColor3 = Color3.fromRGB(140, 180, 220)
+onlineTitle.Font = Enum.Font.SourceSans
+onlineTitle.TextSize = 10
+onlineTitle.Parent = createSettingsItem("OnlineTitle", 16, 14)
+
+local smallIcon = Instance.new("TextButton")
+smallIcon.Size = UDim2.new(0, 32, 0, 32)
+smallIcon.Position = UDim2.new(1, -45, 0, 20)
+smallIcon.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+smallIcon.BackgroundTransparency = 0.2
+smallIcon.Text = "🔫"
+smallIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+smallIcon.Font = Enum.Font.SourceSansBold
+smallIcon.TextSize = 10
+smallIcon.BorderSizePixel = 0
+smallIcon.Active = true
+smallIcon.Draggable = true
+smallIcon.Visible = false
+smallIcon.Parent = screenGui
+
+local function updateTopUI()
+    toggleBtn.Text = autoEnabled and "🔫 Авто-огонь: ВКЛ" or "🔫 Авто-огонь: ВЫКЛ"
+    toggleBtn.BackgroundColor3 = autoEnabled and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(70, 70, 70)
+
+    blockBtn.Text = autoBlockEnabled and "🛡️ Автоблок: ВКЛ" or "🛡️ Автоблок: ВЫКЛ"
+    blockBtn.BackgroundColor3 = autoBlockEnabled and Color3.fromRGB(40, 140, 40) or Color3.fromRGB(70, 70, 70)
+
+    weaponSelectBtn.Text = "🎯 Оружие: " .. selectedWeaponMode
+    autoEquipBtn.Text = autoEquipEnabled and ("📥 Автоподбор(" .. selectedWeaponMode .. "): ВКЛ") or "📥 Автоподбор: ВЫКЛ"
+    autoEquipBtn.BackgroundColor3 = autoEquipEnabled and Color3.fromRGB(40, 140, 40) or Color3.fromRGB(70, 70, 70)
+
+    dualModeBtn.Text = dualFocusMode == "Split" and "🎯 Двойное: разные цели" or "🎯 Двойное: одна цель"
+    dualModeBtn.BackgroundColor3 = dualFocusMode == "Split" and Color3.fromRGB(80, 50, 140) or Color3.fromRGB(140, 80, 50)
+    
+    dualSyncBtn.Text = dualFireSyncMode == "Simultaneous" and "⏱️ Стрельба: одновременная" or "⏱️ Стрельба: по очереди"
+    dualSyncBtn.BackgroundColor3 = dualFireSyncMode == "Simultaneous" and Color3.fromRGB(120, 60, 100) or Color3.fromRGB(100, 120, 60)
+
+    platformBtn.Text = movingPlatformEnabled and "🚀 Платформа: ВКЛ" or "🚀 Платформа: ВЫКЛ"
+    platformBtn.BackgroundColor3 = movingPlatformEnabled and Color3.fromRGB(40, 140, 40) or Color3.fromRGB(70, 70, 70)
+
+    healBtn.Text = autoHealEnabled and "💚 Автолечение: ВКЛ" or "💚 Автолечение: ВЫКЛ"
+    healBtn.BackgroundColor3 = autoHealEnabled and Color3.fromRGB(40, 140, 40) or Color3.fromRGB(70, 70, 70)
+
+    targetAllBtn.Text = targetAllEnabled and "👥 Целиться во всех: ВКЛ" or "👥 Целиться во всех: ВЫКЛ"
+    targetAllBtn.BackgroundColor3 = targetAllEnabled and Color3.fromRGB(150, 40, 150) or Color3.fromRGB(70, 70, 70)
+
+    shootModeBtn.Text = simultaneousShootEnabled and "💀 Убить всех: одновременно" or "💀 Убить всех: по очереди"
+    shootModeBtn.BackgroundColor3 = simultaneousShootEnabled and Color3.fromRGB(200, 100, 40) or Color3.fromRGB(70, 70, 70)
+
+    if isHealing then
+        executionLabel.Text = "💚 Статус: ЛЕЧЕНИЕ..."
+        executionLabel.TextColor3 = Color3.fromRGB(40, 255, 40)
+    elseif targetAllEnabled and simultaneousShootEnabled then
+        executionLabel.Text = "💀 Статус: МАССОВОЕ УНИЧТОЖЕНИЕ!"
+        executionLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
+    elseif executionTarget then
+        executionLabel.Text = "🎯 Цель: " .. executionTarget.DisplayName
+        executionLabel.TextColor3 = Color3.fromRGB(255, 255, 40)
+    else
+        executionLabel.Text = "📊 Статус: Поиск цели..."
+        executionLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+    end
+end
+
+local function getButtonColorForState(state)
+    if state == "Заблокирован" then return Color3.fromRGB(180, 40, 40) end
+    if state == "Белый" then return Color3.fromRGB(40, 150, 40) end
+    return Color3.fromRGB(55, 55, 55)
+end
+
+-- Обновление списка игроков
+local function refreshPlayerList()
+    for _, child in ipairs(contentScroll:GetChildren()) do
+        if child.Name == "PlayerRow" then child:Destroy() end
+    end
+
+    local allIds = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= localPlayer then allIds[p.UserId] = { isOnline = true, p = p } end
+    end
+    for uid, info in pairs(userStates) do
+        if not allIds[uid] then allIds[uid] = { isOnline = false, info = info } end
+    end
+
+    local order = 15
+    for uid, data in pairs(allIds) do
+        local state = userStates[uid] and userStates[uid].state or "Нет"
+        local displayName = data.isOnline and data.p.DisplayName or data.info.displayName
+        local name = data.isOnline and data.p.Name or data.info.name
+        local prefix = data.isOnline and "" or "[ОФФЛАЙН] "
+
+        local row = Instance.new("Frame")
+        row.Name = "PlayerRow"
+        row.Size = UDim2.new(1, -6, 0, 22)
+        row.BackgroundTransparency = 1
+        row.LayoutOrder = order
+        row.Parent = contentScroll
+
+        local toggleStateBtn = Instance.new("TextButton")
+        toggleStateBtn.Size = UDim2.new(0.7, -2, 1, 0)
+        toggleStateBtn.BackgroundColor3 = getButtonColorForState(state)
+        toggleStateBtn.Text = prefix .. displayName
+        toggleStateBtn.TextColor3 = data.isOnline and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 150)
+        toggleStateBtn.Font = Enum.Font.SourceSans
+        toggleStateBtn.TextSize = 10
+        toggleStateBtn.Parent = row
+
+        toggleStateBtn.MouseButton1Click:Connect(function()
+            if state == "Нет" then
+                userStates[uid] = { state = "Заблокирован", displayName = displayName, name = name }
+            elseif state == "Заблокирован" then
+                userStates[uid].state = "Белый"
+            elseif state == "Белый" then
+                userStates[uid] = nil
+            end
+            if executionTarget and executionTarget.UserId == uid then
+                executionTarget = nil
+            end
+            refreshPlayerList()
+        end)
+
+        local spectateBtn = Instance.new("TextButton")
+        spectateBtn.Size = UDim2.new(0.3, -2, 1, 0)
+        spectateBtn.Position = UDim2.new(0.7, 2, 0, 0)
+        spectateBtn.BackgroundColor3 = Color3.fromRGB(50, 100, 150)
+        spectateBtn.Text = "👁️"
+        spectateBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        spectateBtn.Font = Enum.Font.SourceSansBold
+        spectateBtn.TextSize = 10
+        spectateBtn.Parent = row
+
+        spectateBtn.MouseButton1Click:Connect(function()
+            if data.isOnline and data.p then
+                spectatingTarget = data.p
+                spectateText.Text = "👁️ Наблюдение: " .. displayName
+            end
+        end)
+
+        order = order + 1
+    end
+end
+
+-- Привязка кнопок
+toggleBtn.MouseButton1Click:Connect(function()
+    autoEnabled = not autoEnabled
+    if autoEnabled then
+        if autoThread then task.cancel(autoThread) end
+        autoThread = task.spawn(autoLoop)
+    else
+        executionTarget = nil
+        if autoThread then task.cancel(autoThread); autoThread = nil end
+    end
+    updateTopUI()
+end)
+
+blockBtn.MouseButton1Click:Connect(function()
+    autoBlockEnabled = not autoBlockEnabled
+    if autoBlockEnabled then
+        if blockThread then task.cancel(blockThread) end
+        blockThread = task.spawn(blockLoop)
+    else
+        if blockThread then task.cancel(blockThread); blockThread = nil end
+    end
+    updateTopUI()
+end)
+
+weaponSelectBtn.MouseButton1Click:Connect(function()
+    if selectedWeaponMode == "Spas 12" then
+        selectedWeaponMode = "Remington"
+    elseif selectedWeaponMode == "Remington" then
+        selectedWeaponMode = "Both"
+    else
+        selectedWeaponMode = "Spas 12"
+    end
+    updateTopUI()
+end)
+
+autoEquipBtn.MouseButton1Click:Connect(function()
+    autoEquipEnabled = not autoEquipEnabled
+    updateTopUI()
+end)
+
+dualModeBtn.MouseButton1Click:Connect(function()
+    if dualFocusMode == "Split" then
+        dualFocusMode = "Concentrate"
+    else
+        dualFocusMode = "Split"
+    end
+    updateTopUI()
+end)
+
+dualSyncBtn.MouseButton1Click:Connect(function()
+    if dualFireSyncMode == "Simultaneous" then
+        dualFireSyncMode = "Sequential"
+    else
+        dualFireSyncMode = "Simultaneous"
+    end
+    updateTopUI()
+end)
+
+platformBtn.MouseButton1Click:Connect(function()
+    movingPlatformEnabled = not movingPlatformEnabled
+    updateTopUI()
+end)
+
+healBtn.MouseButton1Click:Connect(function()
+    autoHealEnabled = not autoHealEnabled
+    updateTopUI()
+end)
+
+targetAllBtn.MouseButton1Click:Connect(function()
+    targetAllEnabled = not targetAllEnabled
+    executionTarget = nil
+    updateTopUI()
+end)
+
+shootModeBtn.MouseButton1Click:Connect(function()
+    simultaneousShootEnabled = not simultaneousShootEnabled
+    updateTopUI()
+end)
+
+minimizeBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = false
+    smallIcon.Visible = true
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    autoEnabled = false
+    autoBlockEnabled = false
+    if autoThread then task.cancel(autoThread) end
+    if blockThread then task.cancel(blockThread) end
+    if movingPlatform then movingPlatform:Destroy() end
+    if localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        Camera.CameraSubject = localPlayer.Character.Humanoid
+    end
+    screenGui:Destroy()
+end)
+
+smallIcon.MouseButton1Click:Connect(function()
+    mainFrame.Visible = true
+    smallIcon.Visible = false
+end)
+
+task.spawn(function()
+    while screenGui.Parent do
+        refreshPlayerList()
+        updateTopUI()
+        task.wait(1)
+    end
+end)
